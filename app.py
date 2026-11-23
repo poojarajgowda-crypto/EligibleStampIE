@@ -1,7 +1,11 @@
 import os
 import secrets
+import pyotp
+import qrcode
+import io
+import base64
 from datetime import datetime, timedelta
-from flask import Flask, render_template_string, request, redirect, url_for
+from flask import Flask, render_template_string, request, redirect, url_for, session
 from flask_sqlalchemy import SQLAlchemy
 from flask_login import LoginManager, UserMixin, login_user, login_required, logout_user, current_user
 from werkzeug.security import generate_password_hash, check_password_hash
@@ -35,9 +39,9 @@ class User(UserMixin, db.Model):
     role = db.Column(db.String(50), nullable=False, default='student')
     irp_filename = db.Column(db.String(200), nullable=True) 
     is_verified = db.Column(db.Boolean, default=False) 
-    # New fields for sharing
     share_token = db.Column(db.String(100), unique=True, nullable=True)
     token_expiry = db.Column(db.DateTime, nullable=True)
+    mfa_secret = db.Column(db.String(32), nullable=True) # NEW: For MFA
 
 @login_manager.user_loader
 def load_user(user_id):
@@ -80,7 +84,6 @@ def student_dashboard():
             db.session.commit()
             return f"File uploaded securely! <a href='/student'>Go back</a>"
 
-    # STATUS LOGIC
     if current_user.is_verified:
         status = "✅ Verified by College"
     elif current_user.irp_filename:
@@ -88,7 +91,6 @@ def student_dashboard():
     else:
         status = "❌ No document uploaded"
 
-    # SHARE LINK LOGIC
     share_link_html = ""
     if current_user.is_verified:
         if not current_user.share_token:
@@ -169,11 +171,76 @@ def verifier_dashboard():
 def employer_dashboard():
     if current_user.role != 'employer':
         return "Access Denied.", 403
+    
+    # MFA Setup Link
+    mfa_status = "<p style='color:green;'>✅ MFA is enabled</p>" if current_user.mfa_secret else "<p style='color:red;'><a href='/setup_mfa'>Setup MFA (Required for Security)</a></p>"
+    
     return f'''
         <h2>Employer Dashboard</h2>
         <p>Welcome, {current_user.email}.</p>
+        {mfa_status}
         <p>Please enter the share link provided by the student to verify their eligibility.</p>
         <br><a href="/logout">Logout</a>
+    '''
+
+# --- MFA SETUP ROUTE ---
+@app.route("/setup_mfa")
+@login_required
+def setup_mfa():
+    if current_user.role != 'employer':
+        return "Only employers need MFA.", 403
+    
+    if not current_user.mfa_secret:
+        current_user.mfa_secret = pyotp.random_base32()
+        db.session.commit()
+    
+    # Generate QR Code
+    totp_uri = pyotp.totp.TOTP(current_user.mfa_secret).provisioning_uri(name=current_user.email, issuer_name="EligibleStampIE")
+    img = qrcode.make(totp_uri)
+    buf = io.BytesIO()
+    img.save(buf)
+    image_base64 = base64.b64encode(buf.getvalue()).decode('utf-8')
+    
+    return f'''
+        <div style="text-align:center; margin-top:50px; font-family:Arial;">
+            <h2>Setup Multi-Factor Authentication</h2>
+            <p>1. Scan this QR code with Google Authenticator or Microsoft Authenticator:</p>
+            <img src="data:image/png;base64,{image_base64}" style="border:1px solid black;">
+            
+            <p style="margin-top: 30px;">2. Or enter this setup key manually:</p>
+            <h3 style="color:blue;">{current_user.mfa_secret}</h3>
+            
+            <br><br>
+            <p><a href="/employer">Go back to Dashboard</a></p>
+        </div>
+    '''
+
+# --- MFA VERIFY ROUTE ---
+@app.route("/verify_2fa", methods=['GET', 'POST'])
+def verify_2fa():
+    user_id = session.get('pre_2fa_user_id')
+    if not user_id:
+        return redirect(url_for('login'))
+    
+    user = db.session.get(User, user_id)
+    
+    if request.method == 'POST':
+        code = request.form.get('code')
+        totp = pyotp.TOTP(user.mfa_secret)
+        if totp.verify(code):
+            login_user(user)
+            session.pop('pre_2fa_user_id', None)
+            return redirect(url_for('home'))
+        else:
+            return "Invalid code. <a href='/verify_2fa'>Try again</a>"
+            
+    return '''
+        <h2>Enter Authenticator Code</h2>
+        <p>Open Google Authenticator and enter the 6-digit code.</p>
+        <form method="POST">
+            <input type="text" name="code" required><br><br>
+            <button type="submit">Verify</button>
+        </form>
     '''
 
 # --- PUBLIC VERIFICATION ROUTE (The Share Link) ---
@@ -227,11 +294,18 @@ def login():
         email = request.form.get('email')
         password = request.form.get('password')
         user = User.query.filter_by(email=email).first()
+        
         if user and check_password_hash(user.password_hash, password):
+            # --- MFA CHECK ---
+            if user.role == 'employer' and user.mfa_secret:
+                session['pre_2fa_user_id'] = user.id
+                return redirect(url_for('verify_2fa'))
+            
             login_user(user)
             return redirect(url_for('home'))
         else:
             return "Invalid credentials. <a href='/login'>Try again</a>"
+            
     return '''
         <h2>Login</h2>
         <form method="POST">
@@ -251,4 +325,4 @@ with app.app_context():
     db.create_all()
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    app.run(debug=True, use_reloader=False)
