@@ -56,7 +56,9 @@ def home():
             return redirect(url_for('verifier_dashboard'))
         elif current_user.role == 'employer':
             return redirect(url_for('employer_dashboard'))
-        return f"<h1>Admin Dashboard</h1><p>Welcome {current_user.email}.</p><a href='/logout'>Logout</a>"
+        elif current_user.role == 'admin':
+            return redirect(url_for('admin_dashboard'))
+        return f"<h1>Dashboard</h1><p>Welcome {current_user.email}!</p><a href='/logout'>Logout</a>"
     return "<h1>Welcome to EligibleStampIE</h1><a href='/register'>Register</a> | <a href='/login'>Login</a>"
 
 # --- STUDENT ROUTE ---
@@ -95,7 +97,7 @@ def student_dashboard():
     if current_user.is_verified:
         if not current_user.share_token:
             current_user.share_token = secrets.token_urlsafe(32)
-            current_user.token_expiry = datetime.utcnow() + timedelta(hours=24)
+            current_user.token_expiry = datetime.utcnow() + timedelta(days=31)
             db.session.commit()
         
         if current_user.token_expiry and current_user.token_expiry > datetime.utcnow():
@@ -171,16 +173,63 @@ def verifier_dashboard():
 def employer_dashboard():
     if current_user.role != 'employer':
         return "Access Denied.", 403
-    
+   
     # MFA Setup Link
     mfa_status = "<p style='color:green;'>✅ MFA is enabled</p>" if current_user.mfa_secret else "<p style='color:red;'><a href='/setup_mfa'>Setup MFA (Required for Security)</a></p>"
-    
+        
     return f'''
-        <h2>Employer Dashboard</h2>
-        <p>Welcome, {current_user.email}.</p>
-        {mfa_status}
-        <p>Please enter the share link provided by the student to verify their eligibility.</p>
-        <br><a href="/logout">Logout</a>
+            <h2>Employer Dashboard</h2>
+            <p>Welcome, {current_user.email}.</p>
+            {mfa_status}
+            <p>Please enter the share link provided by the student to verify their eligibility.</p>
+            <br><a href="/logout">Logout</a>
+        '''
+
+# --- ADMIN ROUTE ---
+@app.route("/admin")
+@login_required
+def admin_dashboard():
+    if current_user.role != 'admin':
+        return "Access Denied. Only Admins can see this.", 403
+    
+    # Get all users from the database
+    all_users = User.query.all()
+    
+    html = "<h2>Admin Dashboard</h2>"
+    html += "<p>Welcome, System Administrator.</p>"
+    html += "<table border='1' style='border-collapse: collapse; width: 100%;'>"
+    html += "<tr><th>ID</th><th>Email</th><th>Role</th><th>Verified Status</th></tr>"
+    
+    for u in all_users:
+        status = "✅ Verified" if u.is_verified else "❌ Not Verified"
+        if u.role != 'student':
+            status = "N/A"
+        html += f"<tr><td>{u.id}</td><td>{u.email}</td><td>{u.role.capitalize()}</td><td>{status}</td></tr>"
+        
+    html += "</table><br>"
+    html += "<a href='/logout'>Logout</a>"
+
+    return html
+
+# --- PUBLIC VERIFICATION ROUTE (The Share Link) ---
+@app.route("/verify/<token>")
+def verify_student(token):
+    student = User.query.filter_by(share_token=token).first()
+    
+    if not student:
+        return "<h2>❌ Invalid or Expired Link</h2><p>This share link does not exist or has been revoked.</p>"
+    
+    if student.token_expiry < datetime.utcnow():
+        return "<h2>❌ Link Expired</h2><p>This share link was only valid for 24 hours.</p>"
+
+    return f'''
+        <div style="text-align:center; margin-top:50px; font-family:Arial;">
+            <h1 style="color:green;">✅ Verified Student</h1>
+            <h2>{student.email}</h2>
+            <p style="font-size:20px;"><b>Status:</b> Stamp 2 (Verified by College)</p>
+            <p style="font-size:20px;"><b>Work Allowance:</b> 20 hours/week (Term Time)</p>
+            <p style="color:gray;"><small>This link expires at: {student.token_expiry.strftime('%Y-%m-%d %H:%M')}</small></p>
+        </div>
     '''
 
 # --- MFA SETUP ROUTE ---
@@ -243,27 +292,6 @@ def verify_2fa():
         </form>
     '''
 
-# --- PUBLIC VERIFICATION ROUTE (The Share Link) ---
-@app.route("/verify/<token>")
-def verify_student(token):
-    student = User.query.filter_by(share_token=token).first()
-    
-    if not student:
-        return "<h2>❌ Invalid or Expired Link</h2><p>This share link does not exist or has been revoked.</p>"
-    
-    if student.token_expiry < datetime.utcnow():
-        return "<h2>❌ Link Expired</h2><p>This share link was only valid for 24 hours.</p>"
-
-    return f'''
-        <div style="text-align:center; margin-top:50px; font-family:Arial;">
-            <h1 style="color:green;">✅ Verified Student</h1>
-            <h2>{student.email}</h2>
-            <p style="font-size:20px;"><b>Status:</b> Stamp 2 (Verified by College)</p>
-            <p style="font-size:20px;"><b>Work Allowance:</b> 20 hours/week (Term Time)</p>
-            <p style="color:gray;"><small>This link expires at: {student.token_expiry.strftime('%Y-%m-%d %H:%M')}</small></p>
-        </div>
-    '''
-
 # --- AUTH ROUTES ---
 @app.route("/register", methods=['GET', 'POST'])
 def register():
@@ -283,9 +311,17 @@ def register():
         <form method="POST">
             Email: <input type="email" name="email" required><br><br>
             Password: <input type="password" name="password" required><br><br>
-            Role: <select name="role"><option value="student">Student</option><option value="verifier">Verifier (College)</option><option value="employer">Employer</option></select><br><br>
-            <button type="submit">Register</button>
-        </form>
+            Role:
+<select name="role">
+    <option value="student">Student</option>
+    <option value="verifier">Verifier (College)</option>
+    <option value="employer">Employer</option>
+    <option value="admin">Admin</option>
+</select>
+<br><br>
+<button type="submit">Register</button>
+</form>
+
     '''
 
 @app.route("/login", methods=['GET', 'POST'])
